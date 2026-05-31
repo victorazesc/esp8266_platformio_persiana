@@ -1,0 +1,36 @@
+# PlatformIO
+.pio/
+.pioenvs/
+.piolibdeps/
+.vscode/.browse.c_cpp.db*
+.vscode/c_cpp_properties.json
+.vscode/launch.json
+.vscode/ipch/
+
+# Secrets locais
+src/local_secrets_esp8266.h
+.env
+.env.*
+!.env.example
+
+# Build / cache
+build/
+dist/
+.cache/
+*.bin
+*.elf
+*.map
+*.hex
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Editor
+.idea/
+*.swp
+*.swo
+
+# Logs
+*.log
