@@ -9,7 +9,8 @@
  * - D1/D2: encoder quadrature
  * - 0% = aberta
  * - 100% = fechada
- * - EEPROM: zeroRaw + maxSteps + dirSign
+ * - EEPROM v3: curso, sinal, posição normalizada e confiança
+ * - reboot durante movimento invalida a posição até nova calibração
  * - stall/timeout de motor
  * - ArduinoOTA
  *
@@ -35,9 +36,11 @@
  * {"jog":"close"}
  * {"jog":"stop"}
  *
- * Calibração:
+ * Calibração segura: aberto -> jog fechar -> fechado.
  * {"calibration":{"setOpenHere":true}}
  * {"calibration":{"setClosedHere":true}}
+ *
+ * Avançado: zeroHere invalida a calibração completa; maxSteps não calibra.
  * {"calibration":{"zeroHere":true}}
  * {"calibration":{"maxSteps":32000}}
  */
@@ -52,7 +55,11 @@
 #include "local_secrets_esp8266.h"
 
 #ifndef MQTT_HOST
-#define MQTT_HOST "192.168.1.136"
+#define MQTT_HOST "192.168.1.57"
+#endif
+
+#ifndef MQTT_HOST_FALLBACK
+#define MQTT_HOST_FALLBACK MQTT_HOST
 #endif
 
 #ifndef MQTT_PORT
@@ -81,33 +88,49 @@ namespace
 
   constexpr int kMotorPwmMax = 1023;
   constexpr int kMotorPwmSlow = 900;
+  constexpr int kMotorPwmEndpoint = 760;
   constexpr long kTickTolerance = 48;
 
   constexpr unsigned long kStatePublishIdleMs = 1000;
   constexpr unsigned long kStatePublishMoveMs = 250;
   constexpr unsigned long kMqttReconnectMs = 3000;
+  constexpr unsigned long kMqttPrimaryProbeInitialMs = 30000;
+  constexpr unsigned long kMqttPrimaryProbeMaxMs = 300000;
   constexpr unsigned long kWifiReconnectMs = 5000;
   constexpr unsigned long kMotorMaxRunMs = 45000;
-  constexpr unsigned long kStallStopMs = 4000;
+  constexpr unsigned long kStallStopMs = 1200;
+  constexpr uint16_t kMqttKeepAliveSeconds = 15;
+  constexpr uint16_t kMqttSocketTimeoutSeconds = 3;
 
   constexpr long kMinCalibrationSpan = 512;
   constexpr long kMaxCalibrationSpan = 120000;
 
-  // Nova versão para ignorar calibração antiga.
-  constexpr uint32_t kEepromMagic = 0x50523156UL;
+  // Versão 3: persiste apenas posição normalizada confirmada com o motor parado.
+  constexpr uint32_t kEepromMagic = 0x50523356UL;
 
-  constexpr char kMqttHost[] = MQTT_HOST;
+  constexpr const char *kMqttHosts[] = {MQTT_HOST, MQTT_HOST_FALLBACK};
+  constexpr size_t kMqttHostCount = sizeof(kMqttHosts) / sizeof(kMqttHosts[0]);
   constexpr uint16_t kMqttPort = MQTT_PORT;
   constexpr char kMqttUser[] = MQTT_USER;
   constexpr char kMqttPassword[] = MQTT_PASSWORD;
   constexpr char kMqttBaseTopic[] = MQTT_BASE_TOPIC;
 
+  enum class CalibrationState : uint8_t
+  {
+    None = 0,
+    OpenReferenceSet = 1,
+    Valid = 2,
+  };
+
   struct EepromStore
   {
     uint32_t magic;
-    int32_t zeroRaw;
     int32_t maxSteps;
     int32_t dirSign;
+    int32_t normalizedTicks;
+    uint8_t calibrationState;
+    uint8_t positionTrusted;
+    uint8_t reserved[2];
   };
 
   volatile long g_rawTicks = 0;
@@ -122,6 +145,10 @@ namespace
   bool g_motorOn = false;
   bool g_jogMode = false;
   bool g_calibrated = false;
+  bool g_positionKnown = false;
+  bool g_positionTrusted = false;
+  CalibrationState g_calibrationState = CalibrationState::None;
+  int32_t g_persistedNormalizedTicks = 0;
   int g_motorDir = 0;
 
   unsigned long g_motionStartMs = 0;
@@ -129,6 +156,9 @@ namespace
   unsigned long g_lastEncoderChangeMs = 0;
   unsigned long g_lastMqttAttemptMs = 0;
   unsigned long g_lastWifiAttemptMs = 0;
+  unsigned long g_nextMqttPrimaryProbeMs = 0;
+  unsigned long g_mqttPrimaryProbeIntervalMs = kMqttPrimaryProbeInitialMs;
+  size_t g_mqttHostIndex = 0;
 
   long g_lastRawObserved = 0;
 
@@ -150,6 +180,19 @@ namespace
 
   void motorStop();
   void publishState(bool force = false);
+  void saveEeprom();
+
+  void markPositionUntrustedForMotion()
+  {
+    if (!g_positionTrusted)
+    {
+      return;
+    }
+
+    g_positionTrusted = false;
+    saveEeprom();
+    Serial.println("[eeprom] posicao marcada como nao confiavel antes do movimento");
+  }
 
   void setPwm(int value)
   {
@@ -159,6 +202,8 @@ namespace
 
   void motorOpen()
   {
+    markPositionUntrustedForMotion();
+
     digitalWrite(kMotorIn1Pin, LOW);
     digitalWrite(kMotorIn2Pin, HIGH);
     setPwm(kMotorPwmMax);
@@ -171,6 +216,8 @@ namespace
 
   void motorClose()
   {
+    markPositionUntrustedForMotion();
+
     digitalWrite(kMotorIn1Pin, HIGH);
     digitalWrite(kMotorIn2Pin, LOW);
     setPwm(kMotorPwmMax);
@@ -200,14 +247,31 @@ namespace
 
   IRAM_ATTR void onEncoderIsr()
   {
-    static const int8_t kTable[16] = {
-        0, -1, 1, 0,
-        1, 0, 0, -1,
-        -1, 0, 0, 1,
-        0, 1, -1, 0};
+    // digitalRead() e tabelas const podem acessar flash com o cache indisponível
+    // durante a ISR no ESP8266. Leia o registrador GPIO e use apenas comparações.
+    const uint32_t gpioLevels = GPI;
+    const uint8_t next =
+        ((gpioLevels >> kEncoderAPin) & 1U) |
+        (((gpioLevels >> kEncoderBPin) & 1U) << 1U);
+    const uint8_t transition = (g_encPrev << 2U) | next;
 
-    const uint8_t next = readEncoderQuadratureState();
-    g_rawTicks += kTable[(g_encPrev << 2U) | next];
+    if (
+        transition == 2U ||
+        transition == 4U ||
+        transition == 11U ||
+        transition == 13U)
+    {
+      g_rawTicks++;
+    }
+    else if (
+        transition == 1U ||
+        transition == 7U ||
+        transition == 8U ||
+        transition == 14U)
+    {
+      g_rawTicks--;
+    }
+
     g_encPrev = next;
   }
 
@@ -258,11 +322,68 @@ namespace
     return constrain(static_cast<int>(roundf(currentPercent())), 0, 100);
   }
 
+  const char *calibrationStateName()
+  {
+    switch (g_calibrationState)
+    {
+    case CalibrationState::OpenReferenceSet:
+      return "open_reference_set";
+    case CalibrationState::Valid:
+      return "valid";
+    default:
+      return "none";
+    }
+  }
+
+  void refreshCalibrationStatus()
+  {
+    g_calibrated =
+        g_calibrationState == CalibrationState::Valid &&
+        g_positionKnown;
+  }
+
+  void persistTrustedPositionAtRest()
+  {
+    if (
+        !g_positionKnown ||
+        g_calibrationState != CalibrationState::Valid)
+    {
+      return;
+    }
+
+    const int32_t normalized =
+        static_cast<int32_t>(effectiveTicks());
+
+    if (
+        g_positionTrusted &&
+        g_persistedNormalizedTicks == normalized)
+    {
+      return;
+    }
+
+    g_persistedNormalizedTicks = normalized;
+    g_positionTrusted = true;
+    saveEeprom();
+    Serial.printf(
+        "[eeprom] posicao parada confirmada normalizedTicks=%ld\n",
+        static_cast<long>(g_persistedNormalizedTicks));
+  }
+
   void stopAndHoldCurrentPosition()
   {
     g_jogMode = false;
     motorStop();
-    g_desiredPercent = roundedCurrentPercent();
+
+    if (g_positionKnown)
+    {
+      g_desiredPercent = roundedCurrentPercent();
+    }
+    else
+    {
+      g_desiredPercent = 0;
+    }
+
+    persistTrustedPositionAtRest();
     publishState(true);
   }
 
@@ -276,6 +397,11 @@ namespace
     if (g_motorOn && g_motorDir < 0)
     {
       return "closing";
+    }
+
+    if (!g_positionKnown)
+    {
+      return "unknown";
     }
 
     const int position = roundedCurrentPercent();
@@ -301,26 +427,61 @@ namespace
     EEPROM.get(0, store);
     EEPROM.end();
 
-    if (
-        store.magic == kEepromMagic &&
+    const bool stateValid =
+        store.calibrationState <= static_cast<uint8_t>(CalibrationState::Valid);
+    const bool spanValid =
         store.maxSteps >= kMinCalibrationSpan &&
-        store.maxSteps <= kMaxCalibrationSpan)
+        store.maxSteps <= kMaxCalibrationSpan;
+    const CalibrationState storedState =
+        stateValid
+            ? static_cast<CalibrationState>(store.calibrationState)
+            : CalibrationState::None;
+    const bool normalizedValid =
+        store.normalizedTicks >= 0 &&
+        store.normalizedTicks <= store.maxSteps;
+    const bool trustedPositionValid =
+        store.positionTrusted == 1U &&
+        normalizedValid &&
+        (storedState == CalibrationState::Valid ||
+         (storedState == CalibrationState::OpenReferenceSet &&
+          store.normalizedTicks == 0));
+
+    if (store.magic == kEepromMagic && stateValid && spanValid)
     {
-      g_zeroRaw = store.zeroRaw;
       g_maxSteps = store.maxSteps;
       g_dirSign = store.dirSign == -1 ? -1 : 1;
-      g_calibrated = true;
+      g_calibrationState = storedState;
+      g_persistedNormalizedTicks =
+          normalizedValid ? store.normalizedTicks : 0;
+      g_positionTrusted = trustedPositionValid;
+      g_positionKnown = trustedPositionValid;
+
+      // O contador incremental volta a zero no boot. Reconstrua uma origem
+      // relativa somente quando a última gravação ocorreu com o motor parado.
+      g_zeroRaw = trustedPositionValid
+                      ? -g_persistedNormalizedTicks * g_dirSign
+                      : 0;
+      refreshCalibrationStatus();
 
       Serial.printf(
-          "[eeprom] zero=%ld maxSteps=%ld dirSign=%d\n",
-          static_cast<long>(g_zeroRaw),
+          "[eeprom] maxSteps=%ld dirSign=%d calibrationState=%s positionTrusted=%s normalizedTicks=%ld\n",
           static_cast<long>(g_maxSteps),
-          g_dirSign);
+          g_dirSign,
+          calibrationStateName(),
+          g_positionTrusted ? "true" : "false",
+          static_cast<long>(g_persistedNormalizedTicks));
     }
     else
     {
-      g_calibrated = false;
-      Serial.println("[eeprom] sem calibracao valida, usando defaults");
+      g_zeroRaw = 0;
+      g_maxSteps = 8000;
+      g_dirSign = 1;
+      g_calibrationState = CalibrationState::None;
+      g_positionKnown = false;
+      g_positionTrusted = false;
+      g_persistedNormalizedTicks = 0;
+      refreshCalibrationStatus();
+      Serial.println("[eeprom] sem parametros de calibracao validos, usando defaults");
     }
   }
 
@@ -329,9 +490,11 @@ namespace
     EepromStore store{};
 
     store.magic = kEepromMagic;
-    store.zeroRaw = g_zeroRaw;
     store.maxSteps = g_maxSteps;
     store.dirSign = g_dirSign;
+    store.normalizedTicks = g_persistedNormalizedTicks;
+    store.calibrationState = static_cast<uint8_t>(g_calibrationState);
+    store.positionTrusted = g_positionTrusted ? 1U : 0U;
 
     EEPROM.begin(sizeof(EepromStore));
     EEPROM.put(0, store);
@@ -356,7 +519,11 @@ namespace
       g_zeroRaw = static_cast<int32_t>(snapshotRaw());
       g_desiredPercent = 0;
       g_dirSign = 1;
-      g_calibrated = false;
+      g_calibrationState = CalibrationState::OpenReferenceSet;
+      g_positionKnown = true;
+      g_positionTrusted = true;
+      g_persistedNormalizedTicks = 0;
+      refreshCalibrationStatus();
 
       saveEeprom();
 
@@ -377,12 +544,25 @@ namespace
       const long raw = snapshotRaw();
       const long span = labs(raw - g_zeroRaw);
 
+      if (
+          g_calibrationState != CalibrationState::OpenReferenceSet ||
+          !g_positionKnown)
+      {
+        Serial.println("[cal] fechado ignorado: defina primeiro uma referencia aberta confiavel");
+        publishState(true);
+        return;
+      }
+
       if (span >= kMinCalibrationSpan && span <= kMaxCalibrationSpan)
       {
         g_maxSteps = static_cast<int32_t>(span);
         g_dirSign = raw >= g_zeroRaw ? 1 : -1;
         g_desiredPercent = 100;
-        g_calibrated = true;
+        g_calibrationState = CalibrationState::Valid;
+        g_positionKnown = true;
+        g_positionTrusted = true;
+        g_persistedNormalizedTicks = g_maxSteps;
+        refreshCalibrationStatus();
 
         saveEeprom();
 
@@ -397,7 +577,9 @@ namespace
       }
       else
       {
-        Serial.printf("[cal] span invalido: %ld\n", span);
+        Serial.printf(
+            "[cal] span invalido: %ld; calibracao permanece incompleta\n",
+            span);
         publishState(true);
       }
 
@@ -414,12 +596,25 @@ namespace
         motorStop();
 
         g_maxSteps = static_cast<int32_t>(maxSteps);
-        g_desiredPercent = roundedCurrentPercent();
-        g_calibrated = true;
+        g_desiredPercent = g_positionKnown ? roundedCurrentPercent() : 0;
+
+        if (
+            g_positionKnown &&
+            g_calibrationState == CalibrationState::Valid)
+        {
+          g_persistedNormalizedTicks =
+              static_cast<int32_t>(effectiveTicks());
+          g_positionTrusted = true;
+        }
+
+        refreshCalibrationStatus();
 
         saveEeprom();
 
-        Serial.printf("[cal] maxSteps definido manualmente: %ld\n", maxSteps);
+        Serial.printf(
+            "[cal] maxSteps definido manualmente: %ld calibrationState=%s\n",
+            maxSteps,
+            calibrationStateName());
         publishState(true);
       }
       else
@@ -438,12 +633,20 @@ namespace
 
       g_zeroRaw = static_cast<int32_t>(snapshotRaw());
       g_desiredPercent = 0;
+      g_dirSign = 1;
+      g_calibrationState = CalibrationState::OpenReferenceSet;
+      g_positionKnown = true;
+      g_positionTrusted = true;
+      g_persistedNormalizedTicks = 0;
+      refreshCalibrationStatus();
 
       saveEeprom();
 
       Serial.printf(
-          "[cal] zero definido aqui zeroRaw=%ld\n",
-          static_cast<long>(g_zeroRaw));
+          "[cal] zero definido aqui zeroRaw=%ld calibrationState=%s calibrated=%s\n",
+          static_cast<long>(g_zeroRaw),
+          calibrationStateName(),
+          g_calibrated ? "true" : "false");
 
       publishState(true);
       return;
@@ -486,7 +689,7 @@ namespace
     ArduinoOTA.onStart([]()
                        {
                          g_jogMode = false;
-                         motorStop();
+                         stopAndHoldCurrentPosition();
                          Serial.println("[ota] inicio"); });
 
     ArduinoOTA.onEnd([]()
@@ -531,6 +734,7 @@ namespace
     doc["device_class"] = "shade";
 
     doc["command_topic"] = g_topicCoverSet;
+    doc["json_command_topic"] = g_topicCommand;
     doc["state_topic"] = g_topicCoverState;
     doc["position_topic"] = g_topicCoverPosition;
     doc["set_position_topic"] = g_topicCoverPositionSet;
@@ -741,7 +945,10 @@ namespace
 
     g_lastMqttAttemptMs = millis();
 
-    Serial.printf("[mqtt] conectando %s:%u\n", kMqttHost, kMqttPort);
+    const char *mqttHost = kMqttHosts[g_mqttHostIndex];
+    g_mqtt.setServer(mqttHost, kMqttPort);
+
+    Serial.printf("[mqtt] conectando %s:%u\n", mqttHost, kMqttPort);
 
     bool connected = false;
 
@@ -769,10 +976,28 @@ namespace
     if (!connected)
     {
       Serial.printf("[mqtt] falha rc=%d\n", g_mqtt.state());
+
+      if (g_mqttHostIndex == 0 && kMqttHostCount > 1)
+      {
+        g_mqttPrimaryProbeIntervalMs =
+            min(g_mqttPrimaryProbeIntervalMs * 2UL, kMqttPrimaryProbeMaxMs);
+      }
+
+      g_mqttHostIndex = (g_mqttHostIndex + 1) % kMqttHostCount;
       return false;
     }
 
     Serial.println("[mqtt] conectado");
+
+    if (g_mqttHostIndex == 0)
+    {
+      g_nextMqttPrimaryProbeMs = 0;
+      g_mqttPrimaryProbeIntervalMs = kMqttPrimaryProbeInitialMs;
+    }
+    else
+    {
+      g_nextMqttPrimaryProbeMs = millis() + g_mqttPrimaryProbeIntervalMs;
+    }
 
     g_mqtt.publish(g_topicAvailability, "online", true);
 
@@ -781,6 +1006,30 @@ namespace
     publishState(true);
 
     return true;
+  }
+
+  void preferPrimaryMqttHost()
+  {
+    if (!g_mqtt.connected() || g_mqttHostIndex == 0 || g_motorOn)
+    {
+      return;
+    }
+
+    const unsigned long now = millis();
+
+    if (g_nextMqttPrimaryProbeMs == 0 ||
+        static_cast<long>(now - g_nextMqttPrimaryProbeMs) < 0)
+    {
+      return;
+    }
+
+    Serial.printf("[mqtt] testando servidor principal %s:%u\n", kMqttHosts[0], kMqttPort);
+
+    g_mqtt.publish(g_topicAvailability, "offline", true);
+    g_mqtt.disconnect();
+    g_mqttHostIndex = 0;
+    g_lastMqttAttemptMs = now - kMqttReconnectMs;
+    g_nextMqttPrimaryProbeMs = 0;
   }
 
   void publishState(bool force)
@@ -800,9 +1049,7 @@ namespace
 
     g_lastStatePublishMs = now;
 
-    const float position = roundf(currentPercent() * 10.0f) / 10.0f;
     const long raw = snapshotRaw();
-    const long normalized = effectiveTicks();
 
     JsonDocument doc;
 
@@ -810,22 +1057,39 @@ namespace
 
     JsonObject state = doc["state"].to<JsonObject>();
 
-    state["position"] = position;
-    state["targetPosition"] = g_desiredPercent;
+    if (g_positionKnown)
+    {
+      state["position"] = roundf(currentPercent() * 10.0f) / 10.0f;
+      state["targetPosition"] = g_desiredPercent;
+      state["normalizedEncoderTicks"] = effectiveTicks();
+    }
+    else
+    {
+      state["position"] = nullptr;
+      state["targetPosition"] = nullptr;
+      state["normalizedEncoderTicks"] = nullptr;
+    }
+
     state["moving"] = g_motorOn;
     state["jogMode"] = g_jogMode;
+    state["motionDirection"] =
+        g_motorOn
+            ? (g_motorDir > 0 ? "opening" : "closing")
+            : "stopped";
     state["calibrated"] = g_calibrated;
+    state["calibrationState"] = calibrationStateName();
+    state["positionKnown"] = g_positionKnown;
+    state["positionTrusted"] = g_positionTrusted;
     state["reachable"] = true;
     state["ip"] = WiFi.localIP().toString();
     state["uptimeMs"] = millis();
     state["wifiRssi"] = WiFi.RSSI();
     state["resetReason"] = g_resetReason;
     state["rawEncoderTicks"] = raw;
-    state["normalizedEncoderTicks"] = normalized;
     state["encoderState"] = readEncoderQuadratureState();
     state["encoderDirectionSign"] = g_dirSign;
-    state["encoderTicksClosedApplied"] = 0;
-    state["encoderTicksOpenApplied"] = g_maxSteps;
+    state["encoderTicksOpenApplied"] = 0;
+    state["encoderTicksClosedApplied"] = g_maxSteps;
     state["pwm"] = g_pwm;
 
     String payload;
@@ -833,10 +1097,19 @@ namespace
 
     g_mqtt.publish(g_topicState, payload.c_str(), true);
 
-    char positionText[8];
-    snprintf(positionText, sizeof(positionText), "%d", roundedCurrentPercent());
+    if (g_positionKnown)
+    {
+      char positionText[8];
+      snprintf(positionText, sizeof(positionText), "%d", roundedCurrentPercent());
 
-    g_mqtt.publish(g_topicCoverPosition, positionText, true);
+      g_mqtt.publish(g_topicCoverPosition, positionText, true);
+    }
+    else
+    {
+      // Remove uma posição retida de antes do reboot.
+      g_mqtt.publish(g_topicCoverPosition, "", true);
+    }
+
     g_mqtt.publish(g_topicCoverState, coverState(), true);
   }
 
@@ -866,6 +1139,16 @@ namespace
       return;
     }
 
+    if (!g_calibrated)
+    {
+      if (g_motorOn)
+      {
+        stopAndHoldCurrentPosition();
+      }
+
+      return;
+    }
+
     const long currentTicks = effectiveTicks();
     const long targetTicks = (static_cast<long>(g_desiredPercent) * g_maxSteps) / 100L;
     const long error = targetTicks - currentTicks;
@@ -888,6 +1171,14 @@ namespace
     if (labs(error) < slowZone)
     {
       pwm = kMotorPwmSlow;
+    }
+
+    if (
+        (g_desiredPercent == 0 || g_desiredPercent == 100) &&
+        labs(error) < slowZone * 2L &&
+        pwm > kMotorPwmEndpoint)
+    {
+      pwm = kMotorPwmEndpoint;
     }
 
     if (error > 0)
@@ -946,9 +1237,11 @@ void setup()
 
   setupTopics();
 
-  g_mqtt.setServer(kMqttHost, kMqttPort);
+  g_mqtt.setServer(kMqttHosts[g_mqttHostIndex], kMqttPort);
   g_mqtt.setCallback(onMqttMessage);
   g_mqtt.setBufferSize(4096);
+  g_mqtt.setKeepAlive(kMqttKeepAliveSeconds);
+  g_mqtt.setSocketTimeout(kMqttSocketTimeoutSeconds);
 
   Serial.println("[boot] persiana-mqtt");
 }
@@ -968,6 +1261,7 @@ void loop()
   if (ensureWifi())
   {
     ensureOta();
+    preferPrimaryMqttHost();
     connectMqtt();
   }
 
